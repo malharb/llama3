@@ -97,6 +97,12 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
+        # extended memory variables
+        self.enable_external_mind = args.enable_external_mind
+        self.topk = args.topk
+        self.mask_by_sim = args.mask_by_sim
+        self.sim_threshold = args.sim_threshold
+    
         self.wq = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
@@ -149,6 +155,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        long_range_past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, # K & V cachde
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -175,6 +182,39 @@ class Attention(nn.Module):
         values = repeat_kv(
             values, self.n_rep
         )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+
+        # add memory 
+        if self.enable_external_mind:
+          if long_range_past_key_values is not None:
+            
+            # retrieving memory and setting head dimensions
+            mem_k_cache, mem_v_cache = long_range_past_key_values # unpacking K V cache /// (bsz, memlen, n_heads, head_dim)
+            mem_k_cache = repeat_kv(mem_k_cache, self.n_rep)  # duplicating K from GQA groups to match query heads
+            mem_v_cache = repeat_kv(mem_v_cache, self.n_rep) # duplicating V from GQa groups to match query heads
+
+            self.topk = min(self.topk, mem_k_cache.shape[1]) # check if mem_k_cache has less mem tokens than k
+
+            # normalizing query & key vectors
+            q_norm = (q_norm) / (torch.norm(xq, dim = -1, keepdim = True)) # normalizing head_dim components for Q
+            mem_k_norm = (mem_k_cache) / torch.norm(mem_k_cache, dim = -1, keepdim = True) # normalizing head_dim components for Mem K cache
+            
+            # getting similarities
+            similarities = torch.matmul(q_norm, mem_k_norm.transpose(2, 3)) # (bsz, seqlen, n_heads, memlen), for each query's head get each memory token's similarity
+
+            # getting the top-k similarity values and indices
+            topk_mem_sims, topk_mem_indices = torch.topk(similarities, k = self.topk, dim = -1) # shape is [bsz, seqlen, n_heads, self.topk], get top k from memlen
+
+            # getting the topk memory tokens for all query tokens
+            retrieved_k = torch.gather(mem_k_cache, dim = 1, index = (topk_mem_indices.unsqueeze(-1).expand(-1,-1,-1, self.head_dim))) # shape is [bsz, seqlen, n_heads, self.topk, head_dim] 
+            retrieved_v = torch.gather(mem_v_cache, dim = 1, index = (topk_mem_indices.unsqueeze(-1).expand(-1,-1,-1, self.head_dim)))
+            
+            # adding this to local/internal key & value
+            retrieved_k_reshaped = retrieved_k.transpose(1, 2).reshape(bsz, -1, seqlen * self.topk, self.head_dim)
+            keys = torch.cat([keys, retrieved_k_reshaped], dim = 2) # shape becomes [bsz, n_heads, seq_len * topk + cache_len, head_dim]
+
+            retrieved_v_reshaped = retrieved_v.transpose(1, 2).reshape(bsz, -1, seqlen * self.topk, self.head_dim)
+            values = torch.cat([keys, retrieved_v_reshaped], dim = 2) # shape becomes [bsz, n_heads, seq_len * topk + (cache_len + seq_len), head_dim]
+
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
