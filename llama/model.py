@@ -210,11 +210,22 @@ class Attention(nn.Module):
             
             # adding this to local/internal key & value
             retrieved_k_reshaped = retrieved_k.transpose(1, 2).reshape(bsz, -1, seqlen * self.topk, self.head_dim)
-            keys = torch.cat([keys, retrieved_k_reshaped], dim = 2) # shape becomes [bsz, n_heads, seq_len * topk + cache_len, head_dim]
+            keys = torch.cat([keys, retrieved_k_reshaped], dim = 2) # shape becomes [bsz, n_heads, seq_len * topk + cache_len + seq_len, head_dim]
 
             retrieved_v_reshaped = retrieved_v.transpose(1, 2).reshape(bsz, -1, seqlen * self.topk, self.head_dim)
-            values = torch.cat([keys, retrieved_v_reshaped], dim = 2) # shape becomes [bsz, n_heads, seq_len * topk + (cache_len + seq_len), head_dim]
+            values = torch.cat([keys, retrieved_v_reshaped], dim = 2) # shape becomes [bsz, n_heads, seq_len * topk + cache_len + seq_len, head_dim]
 
+            # creating memory masking
+            memory_mask = torch.full((bsz, self.n_local_heads, seqlen, seqlen * self.topk), float('inf'), device = keys.device)
+            for t in range(seqlen):
+              memory_mask[:, :, t, (t * self.topk):((t+1) * self.topk)] = 0 # for each query vector, assign 1 to its range of memory tokens
+            
+            if mask is not None:
+              combined_mask = torch.cat([memory_mask, mask.expand(bsz, self.n_local_heads, seqlen, -1)], dim = -1)
+            else:
+              combined_mask = memory_mask
+
+            # add similarity threshold ?
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
@@ -222,8 +233,8 @@ class Attention(nn.Module):
             1, 2
         )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        if combined_mask is not None:
+            scores = scores + combined_mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
@@ -314,6 +325,28 @@ class Transformer(nn.Module):
             params.rope_theta,
         )
 
+        self.memory_kv = [(torch.empty(0), torch.empty(0)) for layer in range(self.n_layers)] #em
+
+    def add_to_em(self, memory_tokens : torch.Tensor):
+
+      for layer_idx, layer in enumerate(self.layers):
+        k = layer.attention.wk(memory_tokens) #[bsz, memlen, num_heads * head_dim] // check
+        v = layer.attention.wv(memory_tokens) #[bsz, memlen, num_heads * head_dim] // check
+
+        # reshaping
+        k = k.view(memory_tokens.shape[0], memory_tokens.shape[1], self.n_heads, self.head_dim) # [bsz, memlen, n_heads, head_dim]
+        v = v.view(memory_tokens.shape[0], memory_tokens.shape[1], self.n_heads, self.head_dim) # [bsz, memlen, n_heads, head_dim]
+
+        # adding to memory_kv
+        self.memory_kv[layer_idx] = (
+            torch.cat([self.memory_kv[layer_idx][0], k], dim = 1),
+            torch.cat([self.memory_kv[layer_idx][1], v], dim = 1)
+        )
+
+    def clear_em(self):
+      self.memory_kv = [(torch.empty(0), torch.empty(0)) for layer in range(self.n_layers)] 
+
+    # need to pass in memory blocks here along with enabled use
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         _bsz, seqlen = tokens.shape
@@ -335,8 +368,9 @@ class Transformer(nn.Module):
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
 
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+        # pass in memory
+        for layer_idx, layer in enumerate(self.layers):
+            h = layer(h, start_pos, freqs_cis, mask, self.memory_kv[layer_idx]) # passing memory for correct decoder layer
         h = self.norm(h)
         output = self.output(h).float()
         return output
